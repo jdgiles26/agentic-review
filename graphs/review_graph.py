@@ -7,26 +7,19 @@ from __future__ import annotations
 
 import time
 import uuid
-from typing import Annotated, Any, TypedDict
+from typing import Any, TypedDict
 
 from langgraph.graph import END, StateGraph
-from langgraph.graph.message import add_messages
 
-from agents.base import ROLE_PROMPTS, AgentRole, get_llm
+from agents.base import AgentRole
 from agents.reviewers.code_reviewer import run_code_review
 from agents.specialists.pr_specialist import evaluate_pr
-from schemas.models import (
-    Finding,
-    ReviewCategory,
-    ReviewRequest,
-    ReviewResult,
-    Severity,
-)
+from schemas.models import Finding, ReviewRequest, ReviewResult
 
 
 class ReviewState(TypedDict):
     request: dict
-    messages: Annotated[list, add_messages]
+    messages: list
     findings: list[dict]
     agents_run: list[str]
     summary: str
@@ -34,8 +27,14 @@ class ReviewState(TypedDict):
     score: float | None
 
 
+def _note(role: str, content: str, metadata: dict[str, Any] | None = None) -> dict:
+    """Store agent notes as assistant messages so LangGraph can coerce them."""
+    prefix = f"[{role}] {content}"
+    extra = f" {metadata}" if metadata else ""
+    return {"role": "assistant", "content": prefix + extra}
+
+
 def _supervisor_node(state: ReviewState) -> dict:
-    """Decide which specialists are needed and produce a high-level plan."""
     req = state["request"]
     plan = [AgentRole.CODE_REVIEWER.value, AgentRole.PR_SPECIALIST.value]
     focus = req.get("focus") or []
@@ -48,12 +47,7 @@ def _supervisor_node(state: ReviewState) -> dict:
 
     return {
         "agents_run": plan,
-        "messages": [
-            {
-                "role": "supervisor",
-                "content": f"Plan: invoke {', '.join(plan)}",
-            }
-        ],
+        "messages": state.get("messages", []) + [_note("supervisor", f"Plan: invoke {', '.join(plan)}")],
     }
 
 
@@ -62,7 +56,8 @@ def _code_reviewer_node(state: ReviewState) -> dict:
     findings = run_code_review(diff)
     return {
         "findings": state.get("findings", []) + [f.model_dump() for f in findings],
-        "messages": [{"role": "code_reviewer", "content": f"Produced {len(findings)} findings"}],
+        "messages": state.get("messages", [])
+        + [_note("code_reviewer", f"Produced {len(findings)} findings")],
     }
 
 
@@ -80,13 +75,8 @@ def _pr_specialist_node(state: ReviewState) -> dict:
     )
     return {
         "summary": summary,
-        "messages": [
-            {
-                "role": "pr_specialist",
-                "content": summary,
-                "metadata": {"actions": [a.model_dump() for a in actions]},
-            }
-        ],
+        "messages": state.get("messages", [])
+        + [_note("pr_specialist", summary, {"actions": [a.model_dump() for a in actions]})],
     }
 
 
@@ -155,9 +145,7 @@ def run_review(request: ReviewRequest) -> ReviewResult:
 
     findings = [Finding(**f) for f in final.get("findings", [])]
     role_values = {r.value for r in AgentRole}
-    agents = [
-        AgentRole(a) for a in final.get("agents_run", []) if a in role_values
-    ]
+    agents = [AgentRole(a) for a in final.get("agents_run", []) if a in role_values]
 
     return ReviewResult(
         request_id=request_id,
