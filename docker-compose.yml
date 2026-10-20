@@ -4,12 +4,15 @@ services:
     ports:
       - "8000:8000"
     env_file:
-      - .env
+      - path: .env
+        required: false
     environment:
-      - CORS_ORIGINS=*
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+    volumes:
+      - review-data:/data
     restart: unless-stopped
 
-  # Optional: run the Next.js UI (requires node image + build)
+  # Optional: run the Next.js UI
   # ui:
   #   image: node:20-alpine
   #   working_dir: /app
@@ -20,3 +23,6 @@ services:
   #     - "3000:3000"
   #   environment:
   #     - NEXT_PUBLIC_API_URL=http://localhost:8000
+
+volumes:
+  review-data:
