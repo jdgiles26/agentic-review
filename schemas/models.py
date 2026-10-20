@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from enum import Enum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, HttpUrl
+from pydantic import BaseModel, Field
 
 
 class Severity(str, Enum):
@@ -26,6 +26,10 @@ class ReviewCategory(str, Enum):
     TEST_COVERAGE = "test_coverage"
     DOCUMENTATION = "documentation"
     DEPENDENCIES = "dependencies"
+
+
+def _utcnow() -> datetime:
+    return datetime.now(UTC)
 
 
 class Finding(BaseModel):
@@ -54,6 +58,11 @@ class ReviewRequest(BaseModel):
     max_findings: int = Field(default=50, ge=1, le=200)
     include_suggestions: bool = True
     model: str | None = None  # override default model
+    # Optional PR context, filled in for GitHub reviews and read by the PR specialist.
+    title: str | None = None
+    body: str | None = None
+    additions: int = Field(default=0, ge=0)
+    deletions: int = Field(default=0, ge=0)
 
 
 class AgentRole(str, Enum):
@@ -71,21 +80,7 @@ class AgentMessage(BaseModel):
     content: str
     findings: list[Finding] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
-    timestamp: datetime = Field(default_factory=datetime.utcnow)
-
-
-class ReviewResult(BaseModel):
-    request_id: str
-    status: Literal["completed", "partial", "failed", "needs_human"]
-    summary: str
-    findings: list[Finding]
-    agents_involved: list[AgentRole]
-    score: float | None = Field(default=None, ge=0.0, le=10.0)
-    recommendation: Literal["approve", "request_changes", "comment"] | None = None
-    raw_messages: list[AgentMessage] = Field(default_factory=list)
-    cost_usd: float | None = None
-    duration_ms: int | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    timestamp: datetime = Field(default_factory=_utcnow)
 
 
 class PRAction(BaseModel):
@@ -104,6 +99,21 @@ class PRAction(BaseModel):
     reviewers: list[str] | None = None
 
 
+class ReviewResult(BaseModel):
+    request_id: str
+    status: Literal["completed", "partial", "failed", "needs_human"]
+    summary: str
+    findings: list[Finding]
+    agents_involved: list[AgentRole]
+    score: float | None = Field(default=None, ge=0.0, le=10.0)
+    recommendation: Literal["approve", "request_changes", "comment"] | None = None
+    actions: list[PRAction] = Field(default_factory=list)
+    raw_messages: list[AgentMessage] = Field(default_factory=list)
+    cost_usd: float | None = None
+    duration_ms: int | None = None
+    created_at: datetime = Field(default_factory=_utcnow)
+
+
 class GitHubWebhookPayload(BaseModel):
     action: str
     number: int | None = None
@@ -116,3 +126,26 @@ class HealthResponse(BaseModel):
     status: str = "ok"
     version: str
     agents_ready: list[str]
+    llm_configured: bool = False
+    github_configured: bool = False
+
+
+class JobView(BaseModel):
+    """Public view of a background review job."""
+
+    id: str
+    kind: str
+    status: Literal["queued", "running", "completed", "failed"]
+    error: str | None = None
+    result: ReviewResult | None = None
+    comment_url: str | None = None
+    created_at: float
+    started_at: float | None = None
+    finished_at: float | None = None
+
+
+class WebhookAccepted(BaseModel):
+    status: Literal["queued"] = "queued"
+    job_id: str
+    pr: int
+    repo: str

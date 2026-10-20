@@ -1,159 +1,301 @@
 """LangGraph multi-agent review pipeline.
 
-Supervisor decides which specialists to run, then synthesizes results.
+supervisor ──┬─> code_reviewer ─────────┐
+             ├─> security_specialist ───┤
+             ├─> architecture_reviewer ─┼─> synthesize ─> END
+             ├─> test_specialist ───────┤
+             ├─> style_linter ──────────┤
+             └─> pr_specialist ─────────┘
+
+The supervisor plans which specialists to run from the request focus; planned
+specialists run in parallel in one superstep and their findings and notes are
+merged by list reducers. A crashing specialist is isolated: the review still
+completes, marked "partial".
 """
 
 from __future__ import annotations
 
+import logging
+import operator
 import time
 import uuid
-from typing import Any, TypedDict
+from collections.abc import Callable
+from functools import lru_cache
+from typing import Annotated, Any, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from agents.base import AgentRole
 from agents.reviewers.code_reviewer import run_code_review
+from agents.specialists.architecture import run_architecture_review
 from agents.specialists.pr_specialist import evaluate_pr
-from schemas.models import Finding, ReviewRequest, ReviewResult
+from agents.specialists.security import run_security_review
+from agents.specialists.style import run_style_review
+from agents.specialists.testing import run_test_review
+from memory.store import save_checkpoint, save_review
+from schemas.models import (
+    AgentMessage,
+    AgentRole,
+    Finding,
+    PRAction,
+    ReviewCategory,
+    ReviewRequest,
+    ReviewResult,
+)
+from tools.diff import changed_files
+from tools.tracing import span
+
+log = logging.getLogger(__name__)
+
+SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"]
+
+Runner = Callable[..., list[Finding]]
+
+# Looked up at call time so tests (and plugins) can swap a runner.
+RUNNERS: dict[AgentRole, Runner] = {
+    AgentRole.CODE_REVIEWER: run_code_review,
+    AgentRole.SECURITY_SPECIALIST: run_security_review,
+    AgentRole.ARCHITECTURE_REVIEWER: run_architecture_review,
+    AgentRole.TEST_SPECIALIST: run_test_review,
+    AgentRole.STYLE_LINTER: run_style_review,
+}
+
+# Which specialist owns each focus category. The code reviewer always runs.
+FOCUS_OWNERS: dict[ReviewCategory, AgentRole] = {
+    ReviewCategory.SECURITY: AgentRole.SECURITY_SPECIALIST,
+    ReviewCategory.DEPENDENCIES: AgentRole.SECURITY_SPECIALIST,
+    ReviewCategory.ARCHITECTURE: AgentRole.ARCHITECTURE_REVIEWER,
+    ReviewCategory.PERFORMANCE: AgentRole.ARCHITECTURE_REVIEWER,
+    ReviewCategory.TEST_COVERAGE: AgentRole.TEST_SPECIALIST,
+    ReviewCategory.STYLE: AgentRole.STYLE_LINTER,
+    ReviewCategory.DOCUMENTATION: AgentRole.STYLE_LINTER,
+    ReviewCategory.CORRECTNESS: AgentRole.CODE_REVIEWER,
+}
 
 
-class ReviewState(TypedDict):
-    request: dict
-    messages: list
-    findings: list[dict]
-    agents_run: list[str]
+class ReviewState(TypedDict, total=False):
+    request: dict[str, Any]
+    plan: list[str]
+    findings: Annotated[list[dict[str, Any]], operator.add]
+    notes: Annotated[list[dict[str, Any]], operator.add]
+    errors: Annotated[list[str], operator.add]
+    final_findings: list[dict[str, Any]]  # deduplicated, ranked, capped by synthesize
+    actions: list[dict[str, Any]]
+    pr_summary: str
     summary: str
     recommendation: str
-    score: float | None
+    score: float
 
 
-def _note(role: str, content: str, metadata: dict[str, Any] | None = None) -> dict:
-    """Store agent notes as assistant messages so LangGraph can coerce them."""
-    prefix = f"[{role}] {content}"
-    extra = f" {metadata}" if metadata else ""
-    return {"role": "assistant", "content": prefix + extra}
+def _note(role: AgentRole, content: str, **metadata: Any) -> dict[str, Any]:
+    return {"role": role.value, "content": content, "metadata": metadata}
 
 
-def _supervisor_node(state: ReviewState) -> dict:
-    req = state["request"]
-    plan = [AgentRole.CODE_REVIEWER.value, AgentRole.PR_SPECIALIST.value]
-    focus = req.get("focus") or []
-    if "security" in focus or not focus:
-        plan.append(AgentRole.SECURITY_SPECIALIST.value)
-    if "architecture" in focus:
-        plan.append(AgentRole.ARCHITECTURE_REVIEWER.value)
-    if "test_coverage" in focus:
-        plan.append(AgentRole.TEST_SPECIALIST.value)
+def plan_specialists(focus: list[str] | list[ReviewCategory]) -> list[AgentRole]:
+    """Specialists to run for a focus list; an empty focus runs everyone."""
+    if not focus:
+        return [*RUNNERS, AgentRole.PR_SPECIALIST]
+    wanted = {AgentRole.CODE_REVIEWER, AgentRole.PR_SPECIALIST}
+    wanted.update(FOCUS_OWNERS[ReviewCategory(c)] for c in focus)
+    return [role for role in [*RUNNERS, AgentRole.PR_SPECIALIST] if role in wanted]
 
+
+def _supervisor_node(state: ReviewState) -> dict[str, Any]:
+    plan = plan_specialists(state["request"].get("focus") or [])
+    names = [r.value for r in plan]
     return {
-        "agents_run": plan,
-        "messages": state.get("messages", []) + [_note("supervisor", f"Plan: invoke {', '.join(plan)}")],
+        "plan": names,
+        "notes": [_note(AgentRole.SUPERVISOR, f"Plan: invoke {', '.join(names)}", plan=names)],
     }
 
 
-def _code_reviewer_node(state: ReviewState) -> dict:
-    diff = state["request"].get("diff") or ""
-    findings = run_code_review(diff)
+def _route(state: ReviewState) -> list[str]:
+    return state["plan"]
+
+
+def _specialist_node(role: AgentRole) -> Callable[[ReviewState], dict[str, Any]]:
+    def node(state: ReviewState) -> dict[str, Any]:
+        req = state["request"]
+        with span("review.node", **{"agent.role": role.value}) as current:
+            try:
+                produced = RUNNERS[role](
+                    req.get("diff") or "", model=req.get("model"), max_findings=req["max_findings"]
+                )
+            except Exception as exc:  # noqa: BLE001 - isolate one specialist's failure
+                log.exception("%s failed", role.value)
+                current.set_attribute("review.error", str(exc))
+                return {
+                    "errors": [f"{role.value}: {exc}"],
+                    "notes": [_note(role, f"Failed: {exc}", error=True)],
+                }
+            current.set_attribute("review.findings", len(produced))
+        findings = [f.model_dump(mode="json") for f in produced]
+        return {
+            "findings": findings,
+            "notes": [_note(role, f"Produced {len(findings)} findings", findings=findings)],
+        }
+
+    node.__name__ = f"{role.value}_node"
+    return node
+
+
+def _pr_specialist_node(state: ReviewState) -> dict[str, Any]:
+    req = state["request"]
+    role = AgentRole.PR_SPECIALIST
+    with span("review.node", **{"agent.role": role.value}):
+        try:
+            summary, actions = evaluate_pr(
+                title=req.get("title") or "Untitled PR",
+                body=req.get("body"),
+                changed_files=req.get("files") or changed_files(req.get("diff") or ""),
+                additions=req.get("additions") or 0,
+                deletions=req.get("deletions") or 0,
+                model=req.get("model"),
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.exception("pr_specialist failed")
+            return {"errors": [f"{role.value}: {exc}"], "notes": [_note(role, f"Failed: {exc}", error=True)]}
+    action_dicts = [a.model_dump(mode="json") for a in actions]
     return {
-        "findings": state.get("findings", []) + [f.model_dump() for f in findings],
-        "messages": state.get("messages", [])
-        + [_note("code_reviewer", f"Produced {len(findings)} findings")],
+        "pr_summary": summary,
+        "actions": action_dicts,
+        "notes": [_note(role, summary or f"{len(actions)} PR hygiene actions", actions=action_dicts)],
     }
 
 
-def _pr_specialist_node(state: ReviewState) -> dict:
-    req = state["request"]
-    title = req.get("title") or "Untitled PR"
-    body = req.get("body")
-    files = req.get("files") or []
-    summary, actions = evaluate_pr(
-        title=title,
-        body=body,
-        changed_files=files,
-        additions=req.get("additions", 0),
-        deletions=req.get("deletions", 0),
+def _dedupe_key(f: dict[str, Any]) -> tuple[Any, ...]:
+    return (f.get("category"), f.get("title", "").strip().lower(), f.get("file_path"), f.get("line_start"))
+
+
+def _rank(f: dict[str, Any]) -> tuple[int, float]:
+    sev = f.get("severity")
+    return (SEVERITY_ORDER.index(sev) if sev in SEVERITY_ORDER else len(SEVERITY_ORDER), -f.get("confidence", 0))
+
+
+def _score(findings: list[dict[str, Any]]) -> tuple[str, float]:
+    counts = {s: sum(1 for f in findings if f.get("severity") == s) for s in SEVERITY_ORDER}
+    if counts["critical"]:
+        return "request_changes", 3.0
+    if counts["high"] > 2:
+        return "request_changes", 5.0
+    if counts["high"]:
+        return "comment", 6.0
+    if findings:
+        return "comment", 7.5
+    return "approve", 9.0
+
+
+def _synthesize_node(state: ReviewState) -> dict[str, Any]:
+    unique: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for f in state.get("findings") or []:
+        key = _dedupe_key(f)
+        # Most severe wins, then most confident, so dedupe never downgrades a finding.
+        if key not in unique or _rank(f) < _rank(unique[key]):
+            unique[key] = f
+    every = sorted(unique.values(), key=_rank)
+    ranked = every[: state["request"]["max_findings"]]
+    # The verdict covers every finding; max_findings only limits what is reported.
+    rec, score = _score(every)
+
+    n_critical = sum(1 for f in every if f.get("severity") == "critical")
+    n_high = sum(1 for f in every if f.get("severity") == "high")
+    shown = f", showing {len(ranked)}" if len(ranked) < len(every) else ""
+    summary = state.get("pr_summary") or (
+        f"Review complete. {len(every)} findings ({n_critical} critical, {n_high} high{shown})."
     )
+    errors = state.get("errors") or []
+    if errors:
+        summary += f" {len(errors)} specialist(s) failed; results are partial."
     return {
+        "final_findings": ranked,
         "summary": summary,
-        "messages": state.get("messages", [])
-        + [_note("pr_specialist", summary, {"actions": [a.model_dump() for a in actions]})],
-    }
-
-
-def _synthesize_node(state: ReviewState) -> dict:
-    findings = state.get("findings", [])
-    n_critical = sum(1 for f in findings if f.get("severity") == "critical")
-    n_high = sum(1 for f in findings if f.get("severity") == "high")
-
-    if n_critical > 0:
-        rec = "request_changes"
-        score = 3.0
-    elif n_high > 2:
-        rec = "request_changes"
-        score = 5.0
-    elif findings:
-        rec = "comment"
-        score = 7.0
-    else:
-        rec = "approve"
-        score = 9.0
-
-    summary = state.get("summary") or (
-        f"Review complete. {len(findings)} findings "
-        f"({n_critical} critical, {n_high} high)."
-    )
-    return {
         "recommendation": rec,
         "score": score,
-        "summary": summary,
+        "notes": [_note(AgentRole.SUPERVISOR, f"Recommendation: {rec} ({score})")],
     }
 
 
-def build_review_graph():
+def _compile(checkpointer: Any = None):
     g = StateGraph(ReviewState)
     g.add_node("supervisor", _supervisor_node)
-    g.add_node("code_reviewer", _code_reviewer_node)
-    g.add_node("pr_specialist", _pr_specialist_node)
+    specialists = [r.value for r in RUNNERS]
+    for role in RUNNERS:
+        g.add_node(role.value, _specialist_node(role))
+    g.add_node(AgentRole.PR_SPECIALIST.value, _pr_specialist_node)
     g.add_node("synthesize", _synthesize_node)
 
     g.set_entry_point("supervisor")
-    g.add_edge("supervisor", "code_reviewer")
-    g.add_edge("code_reviewer", "pr_specialist")
-    g.add_edge("pr_specialist", "synthesize")
+    g.add_conditional_edges("supervisor", _route, [*specialists, AgentRole.PR_SPECIALIST.value])
+    for name in [*specialists, AgentRole.PR_SPECIALIST.value]:
+        g.add_edge(name, "synthesize")
     g.add_edge("synthesize", END)
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)
 
 
-def run_review(request: ReviewRequest) -> ReviewResult:
-    """Public entry point used by API and CLI."""
+@lru_cache(maxsize=1)
+def _default_graph():
+    return _compile()
+
+
+def build_review_graph(checkpointer: Any = None):
+    """The compiled review graph.
+
+    Without a checkpointer the graph is compiled once and shared (it is stateless and
+    thread-safe). Pass any LangGraph checkpointer (e.g. MemorySaver) to get a graph whose
+    per-thread state can be inspected or resumed via `config={"configurable": {"thread_id": ...}}`.
+    """
+    return _default_graph() if checkpointer is None else _compile(checkpointer)
+
+
+def run_review(request: ReviewRequest, thread_id: str | None = None) -> ReviewResult:
+    """Public entry point used by API, CLI, and background jobs.
+
+    The final state is checkpointed under `thread_id` (default: the request id) and can be
+    read back with `memory.store.load_checkpoint`.
+    """
     start = time.perf_counter()
     request_id = str(uuid.uuid4())
-    graph = build_review_graph()
+    with span("review.run", **{"review.request_id": request_id}) as current:
+        final = build_review_graph().invoke({"request": request.model_dump(mode="json")})
+        duration_ms = int((time.perf_counter() - start) * 1000)
 
-    initial: ReviewState = {
-        "request": request.model_dump(),
-        "messages": [],
-        "findings": [],
-        "agents_run": [],
-        "summary": "",
-        "recommendation": "comment",
-        "score": None,
-    }
+        notes = final.get("notes") or []
+        plan = [AgentRole(a) for a in final.get("plan") or []]
+        errors = final.get("errors") or []
+        result = ReviewResult(
+            request_id=request_id,
+            status="partial" if errors else "completed",
+            summary=final.get("summary", ""),
+            findings=[Finding(**f) for f in final.get("final_findings") or []],
+            agents_involved=[AgentRole.SUPERVISOR, *plan],
+            score=final.get("score"),
+            recommendation=final.get("recommendation"),
+            actions=[PRAction(**a) for a in final.get("actions") or []],
+            raw_messages=[
+                AgentMessage(
+                    role=AgentRole(n["role"]),
+                    content=n["content"],
+                    findings=[Finding(**f) for f in n.get("metadata", {}).get("findings", [])],
+                    metadata={k: v for k, v in n.get("metadata", {}).items() if k != "findings"},
+                )
+                for n in notes
+            ],
+            duration_ms=duration_ms,
+        )
+        current.set_attribute("review.findings", len(result.findings))
+        current.set_attribute("review.recommendation", result.recommendation or "")
 
-    final = graph.invoke(initial)
-    duration_ms = int((time.perf_counter() - start) * 1000)
-
-    findings = [Finding(**f) for f in final.get("findings", [])]
-    role_values = {r.value for r in AgentRole}
-    agents = [AgentRole(a) for a in final.get("agents_run", []) if a in role_values]
-
-    return ReviewResult(
-        request_id=request_id,
-        status="completed",
-        summary=final.get("summary", ""),
-        findings=findings,
-        agents_involved=agents or [AgentRole.CODE_REVIEWER, AgentRole.PR_SPECIALIST],
-        score=final.get("score"),
-        recommendation=final.get("recommendation"),
-        duration_ms=duration_ms,
-    )
+    try:
+        save_review(request, result)
+        save_checkpoint(
+            thread_id or request_id,
+            {
+                "request_id": request_id,
+                "findings": [f.model_dump(mode="json") for f in result.findings],
+                "recommendation": result.recommendation,
+                "score": result.score,
+                "summary": result.summary,
+            },
+        )
+    except Exception:  # noqa: BLE001 - persistence must never fail a review
+        log.exception("Failed to persist review %s", request_id)
+    return result
