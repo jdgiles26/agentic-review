@@ -175,7 +175,7 @@ def test_signed_webhook_queues_review_without_posting_by_default(client, monkeyp
         content=body,
         headers={"X-GitHub-Event": "pull_request", "X-Hub-Signature-256": _sign("s3cret", body)},
     )
-    assert res.status_code == 202
+    assert res.status_code == 200
     queued = res.json()
     assert queued["status"] == "queued"
     assert queued["repo"] == "acme/widgets"

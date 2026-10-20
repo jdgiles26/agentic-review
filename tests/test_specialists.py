@@ -75,9 +75,9 @@ def test_max_findings_is_respected():
     assert len(run_structured_review(AgentRole.SECURITY_SPECIALIST, diff, max_findings=3)) == 3
 
 
-def test_code_reviewer_does_not_duplicate_security_heuristics():
+def test_code_reviewer_also_runs_security_heuristics():
     findings = run_structured_review(AgentRole.CODE_REVIEWER, AUTH_DIFF)
-    assert all(f.category != ReviewCategory.SECURITY for f in findings)
+    assert {f.title for f in findings} == {"Secret logged", "Hardcoded secret"}
 
 
 def test_finding_draft_rejects_out_of_range_confidence():

@@ -1,8 +1,8 @@
 """In-process background job queue for webhook-triggered reviews.
 
 Jobs live in memory and are lost on restart. The pending queue holds at most
-MAX_JOBS jobs (further webhooks get 503) and finished jobs are pruned, so a busy
-webhook cannot grow memory without limit. Posting results back to GitHub is an
+REVIEW_MAX_JOBS jobs (default 500); further webhooks get 503 and the oldest
+finished jobs are pruned, so a busy webhook cannot grow memory without limit. Posting results back to GitHub is an
 outward-facing action and is gated behind REVIEW_POST_COMMENTS=true.
 """
 
@@ -26,7 +26,7 @@ from tools.tracing import span
 
 log = logging.getLogger(__name__)
 
-MAX_JOBS = 500
+MAX_JOBS = 500  # default for REVIEW_MAX_JOBS
 JobStatus = Literal["queued", "running", "completed", "failed"]
 
 
@@ -62,6 +62,15 @@ _queue: asyncio.Queue[str] | None = None
 _worker: asyncio.Task | None = None
 
 
+def max_jobs() -> int:
+    """Queue/registry bound from REVIEW_MAX_JOBS (a positive integer; invalid values use the default)."""
+    try:
+        value = int(os.getenv("REVIEW_MAX_JOBS", str(MAX_JOBS)))
+    except ValueError:
+        return MAX_JOBS
+    return value if value > 0 else MAX_JOBS
+
+
 def posting_enabled() -> bool:
     return os.getenv("REVIEW_POST_COMMENTS", "").lower() in {"1", "true", "yes"}
 
@@ -76,11 +85,12 @@ def list_jobs(limit: int = 20) -> list[Job]:
 
 def _register(job: Job) -> None:
     _jobs[job.id] = job
-    if len(_jobs) <= MAX_JOBS:
+    limit = max_jobs()
+    if len(_jobs) <= limit:
         return
     # Drop the oldest finished jobs first; never drop work that is still pending.
     for job_id in [j for j, v in _jobs.items() if v.status in {"completed", "failed"}]:
-        if len(_jobs) <= MAX_JOBS:
+        if len(_jobs) <= limit:
             break
         del _jobs[job_id]
 
@@ -145,7 +155,7 @@ async def start_queue() -> None:
     global _queue, _worker
     if _queue is not None:
         return
-    _queue = asyncio.Queue(maxsize=MAX_JOBS)
+    _queue = asyncio.Queue(maxsize=max_jobs())
     _worker = asyncio.create_task(_worker_loop())
 
 

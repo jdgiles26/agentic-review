@@ -54,6 +54,21 @@ def parse_added_lines(diff: str) -> list[AddedLine]:
     return added
 
 
+def looks_like_diff(text: str) -> bool:
+    """True when the text has unified-diff structure (added lines, hunks, or file headers)."""
+    return any(
+        line.startswith(("+", "@@ ", "diff --git ")) or (line.startswith("--- ") and nxt.startswith("+++ "))
+        for line, nxt in zip(text.splitlines(), text.splitlines()[1:] + [""], strict=True)
+    )
+
+
+def review_lines(text: str) -> list[AddedLine]:
+    """Lines to review: added lines of a diff, or every line of plain source code (numbered from 1)."""
+    if looks_like_diff(text):
+        return parse_added_lines(text)
+    return [AddedLine(None, i, line) for i, line in enumerate(text.splitlines(), start=1)]
+
+
 def changed_files(diff: str) -> list[str]:
     """Target paths named in `+++` headers, in order, without duplicates."""
     seen: dict[str, None] = {}

@@ -30,6 +30,11 @@ CREATE TABLE IF NOT EXISTS reviews (
     score REAL
 );
 CREATE INDEX IF NOT EXISTS reviews_created_at ON reviews (created_at);
+CREATE TABLE IF NOT EXISTS checkpoints (
+    thread_id TEXT PRIMARY KEY,
+    updated_at REAL NOT NULL,
+    state_json TEXT NOT NULL
+);
 """
 
 _initialized: set[Path] = set()
@@ -86,6 +91,21 @@ def get_review(request_id: str) -> dict[str, Any] | None:
             "SELECT result_json FROM reviews WHERE request_id = ?",
             (request_id,),
         ).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def save_checkpoint(thread_id: str, state: dict[str, Any]) -> None:
+    """Persist the latest review state for a conversation/thread id (last write wins)."""
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO checkpoints (thread_id, updated_at, state_json) VALUES (?, ?, ?)",
+            (thread_id, time.time(), json.dumps(state, default=str)),
+        )
+
+
+def load_checkpoint(thread_id: str) -> dict[str, Any] | None:
+    with _connect() as conn:
+        row = conn.execute("SELECT state_json FROM checkpoints WHERE thread_id = ?", (thread_id,)).fetchone()
     return json.loads(row[0]) if row else None
 
 

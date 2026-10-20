@@ -1,10 +1,9 @@
 .git
-.github
 .env
 .review
 **/__pycache__
 **/.pytest_cache
+**/node_modules
+**/.next
 .venv
 venv
-ui
-tests

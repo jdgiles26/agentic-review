@@ -31,7 +31,7 @@ from agents.specialists.pr_specialist import evaluate_pr
 from agents.specialists.security import run_security_review
 from agents.specialists.style import run_style_review
 from agents.specialists.testing import run_test_review
-from memory.store import save_review
+from memory.store import save_checkpoint, save_review
 from schemas.models import (
     AgentMessage,
     AgentRole,
@@ -214,9 +214,7 @@ def _synthesize_node(state: ReviewState) -> dict[str, Any]:
     }
 
 
-@lru_cache(maxsize=1)
-def build_review_graph():
-    """Compile the graph once; it is stateless and safe to share across threads."""
+def _compile(checkpointer: Any = None):
     g = StateGraph(ReviewState)
     g.add_node("supervisor", _supervisor_node)
     specialists = [r.value for r in RUNNERS]
@@ -230,11 +228,30 @@ def build_review_graph():
     for name in [*specialists, AgentRole.PR_SPECIALIST.value]:
         g.add_edge(name, "synthesize")
     g.add_edge("synthesize", END)
-    return g.compile()
+    return g.compile(checkpointer=checkpointer)
 
 
-def run_review(request: ReviewRequest) -> ReviewResult:
-    """Public entry point used by API, CLI, and background jobs."""
+@lru_cache(maxsize=1)
+def _default_graph():
+    return _compile()
+
+
+def build_review_graph(checkpointer: Any = None):
+    """The compiled review graph.
+
+    Without a checkpointer the graph is compiled once and shared (it is stateless and
+    thread-safe). Pass any LangGraph checkpointer (e.g. MemorySaver) to get a graph whose
+    per-thread state can be inspected or resumed via `config={"configurable": {"thread_id": ...}}`.
+    """
+    return _default_graph() if checkpointer is None else _compile(checkpointer)
+
+
+def run_review(request: ReviewRequest, thread_id: str | None = None) -> ReviewResult:
+    """Public entry point used by API, CLI, and background jobs.
+
+    The final state is checkpointed under `thread_id` (default: the request id) and can be
+    read back with `memory.store.load_checkpoint`.
+    """
     start = time.perf_counter()
     request_id = str(uuid.uuid4())
     with span("review.run", **{"review.request_id": request_id}) as current:
@@ -269,6 +286,16 @@ def run_review(request: ReviewRequest) -> ReviewResult:
 
     try:
         save_review(request, result)
+        save_checkpoint(
+            thread_id or request_id,
+            {
+                "request_id": request_id,
+                "findings": [f.model_dump(mode="json") for f in result.findings],
+                "recommendation": result.recommendation,
+                "score": result.score,
+                "summary": result.summary,
+            },
+        )
     except Exception:  # noqa: BLE001 - persistence must never fail a review
         log.exception("Failed to persist review %s", request_id)
     return result

@@ -17,13 +17,14 @@ from pydantic import BaseModel, Field
 
 from agents.base import ROLE_PROMPTS, UNTRUSTED_CONTENT_NOTE, candidate_models, fence, get_llm, llm_available
 from schemas.models import AgentRole, Finding, ReviewCategory, Severity
-from tools.diff import AddedLine, changed_files, parse_added_lines
+from tools.diff import AddedLine, changed_files, review_lines
 from tools.tracing import record_token_usage, span
 
 log = logging.getLogger(__name__)
 
 MAX_DIFF_CHARS = 12_000
 LARGE_DIFF_LINES = 800
+LARGE_DIFF_CHARS = 8_000
 
 
 class FindingDraft(BaseModel):
@@ -70,7 +71,7 @@ _LOGGED_SECRET = re.compile(
     r"\b(print|console\.log|log(?:ger)?\.\w+|logging\.\w+)\s*\(.*\b(password|passwd|token|secret)",
     re.IGNORECASE,
 )
-_TODO = re.compile(r"\b(TODO|FIXME|XXX)\b")
+_TODO = re.compile(r"\b(TODO|FIXME|XXX|xxx)\b")
 _TEST_PATH = re.compile(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*$|_test\.\w+$|\.(spec|test)\.\w+$")
 _NEW_LOGIC = re.compile(r"^\s*(async\s+def|def|function|class)\s+\w+|=>\s*\{")
 
@@ -95,7 +96,7 @@ def _security_heuristics(added: list[AddedLine]) -> list[Finding]:
                     confidence=0.9,
                 )
             )
-        if _HARDCODED_SECRET.search(line.text) and not _is_test_path(line.file_path):
+        if _HARDCODED_SECRET.search(line.text):
             found.append(
                 _at(
                     line,
@@ -162,8 +163,8 @@ def _style_heuristics(added: list[AddedLine]) -> list[Finding]:
     ]
 
 
-def _architecture_heuristics(added: list[AddedLine]) -> list[Finding]:
-    if len(added) <= LARGE_DIFF_LINES:
+def _architecture_heuristics(added: list[AddedLine], diff: str) -> list[Finding]:
+    if len(added) <= LARGE_DIFF_LINES and len(diff) <= LARGE_DIFF_CHARS:
         return []
     return [
         Finding(
@@ -171,7 +172,7 @@ def _architecture_heuristics(added: list[AddedLine]) -> list[Finding]:
             category=ReviewCategory.ARCHITECTURE,
             severity=Severity.MEDIUM,
             title="Large cross-cutting change",
-            description=f"Patch adds {len(added)} lines; module boundaries may have shifted.",
+            description=f"Patch adds {len(added)} lines ({len(diff)} chars); module boundaries may have shifted.",
             suggestion="Confirm the change stays inside the owning package, or split it.",
             confidence=0.5,
         )
@@ -179,21 +180,23 @@ def _architecture_heuristics(added: list[AddedLine]) -> list[Finding]:
 
 
 def heuristic_findings(diff: str, role: AgentRole) -> list[Finding]:
-    """Cheap offline signals over added lines only, so reviews are useful without a model.
+    """Cheap offline signals so reviews are useful without a model.
 
-    Each heuristic belongs to exactly one specialist so the graph never double-reports.
+    Diffs are scanned on added lines only; plain source code is scanned in full.
+    The code reviewer also runs the security checks so a focused review (e.g.
+    focus=correctness) still catches them; synthesize removes the duplicates.
     """
     if not diff.strip():
         return []
-    added = parse_added_lines(diff)
-    if role == AgentRole.SECURITY_SPECIALIST:
+    added = review_lines(diff)
+    if role in {AgentRole.CODE_REVIEWER, AgentRole.SECURITY_SPECIALIST}:
         return _security_heuristics(added)
     if role == AgentRole.TEST_SPECIALIST:
         return _test_heuristics(added, diff)
     if role == AgentRole.STYLE_LINTER:
         return _style_heuristics(added)
     if role == AgentRole.ARCHITECTURE_REVIEWER:
-        return _architecture_heuristics(added)
+        return _architecture_heuristics(added, diff)
     return []
 
 

@@ -15,6 +15,8 @@ COPY graphs ./graphs
 COPY memory ./memory
 COPY schemas ./schemas
 COPY tools ./tools
+COPY tests ./tests
+COPY ui ./ui
 RUN pip install --no-cache-dir . \
     && useradd --create-home --uid 10001 app \
     && mkdir -p /data && chown app:app /data

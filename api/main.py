@@ -9,9 +9,8 @@ import os
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import FastAPI, Header, HTTPException, Query, Request
+from fastapi import Body, FastAPI, Header, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import ValidationError
 
 from agents.base import llm_available
@@ -123,13 +122,14 @@ def review_github_pr(
     number: int,
     focus: list[ReviewCategory] | None = Query(None),
     model: str | None = Query(None),
+    focus_body: list[ReviewCategory] | None = Body(None, description="Focus categories (alternative to ?focus=)"),
 ):
     """Fetch a PR from GitHub and run the review pipeline."""
     client = GitHubClient()
     if not client.available:
         raise HTTPException(status_code=503, detail="GITHUB_TOKEN not configured")
     try:
-        req = build_pr_review_request(client, owner, repo, number, focus=focus, model=model)
+        req = build_pr_review_request(client, owner, repo, number, focus=focus or focus_body, model=model)
     except Exception as e:
         raise HTTPException(status_code=502, detail=f"GitHub error: {e}") from e
     return create_review(req)
@@ -149,7 +149,15 @@ def _verify_signature(body: bytes, signature: str | None) -> None:
         raise HTTPException(status_code=401, detail="Invalid webhook signature")
 
 
-@app.post("/v1/webhooks/github", status_code=202, response_model=WebhookAccepted)
+@app.post(
+    "/v1/webhooks/github",
+    openapi_extra={
+        "requestBody": {
+            "required": True,
+            "content": {"application/json": {"schema": GitHubWebhookPayload.model_json_schema()}},
+        }
+    },
+)
 async def github_webhook(
     request: Request,
     x_github_event: str | None = Header(None),
@@ -160,9 +168,9 @@ async def github_webhook(
     _verify_signature(body, x_hub_signature_256)
 
     if x_github_event == "ping":
-        return _ok({"status": "pong"})
+        return {"status": "pong"}
     if x_github_event not in {None, "pull_request"}:
-        return _ok({"status": "ignored", "reason": f"event={x_github_event}"})
+        return {"status": "ignored", "reason": f"event={x_github_event}"}
 
     try:
         payload = GitHubWebhookPayload.model_validate_json(body or b"{}")
@@ -170,7 +178,7 @@ async def github_webhook(
         raise HTTPException(status_code=400, detail=f"Invalid payload: {e}") from e
 
     if payload.action not in REVIEW_ACTIONS:
-        return _ok({"status": "ignored", "reason": f"action={payload.action}"})
+        return {"status": "ignored", "reason": f"action={payload.action}"}
     if not payload.pull_request or not payload.repository:
         raise HTTPException(status_code=400, detail="Missing PR or repository")
 
@@ -190,11 +198,6 @@ async def github_webhook(
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e)) from e
     return WebhookAccepted(job_id=job.id, pr=number, repo=full_name)
-
-
-def _ok(content: dict[str, Any]) -> JSONResponse:
-    """Non-queued webhook replies are 200, not the route's default 202."""
-    return JSONResponse(content, status_code=200)
 
 
 @app.get("/v1/jobs/{job_id}", response_model=JobView)

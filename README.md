@@ -25,10 +25,15 @@ supervisor ──┬─> code_reviewer ─────────┐
 - The **supervisor** picks specialists from `focus` (empty focus = all of them).
 - Specialists run **in parallel** (one LangGraph superstep). Each returns Pydantic-validated findings.
 - With `OPENAI_API_KEY` set, specialists use structured LLM output (primary model, then `REVIEW_FALLBACK_MODEL`).
-  Without a key they run deterministic heuristics over the **added lines** of the diff, with `file:line` locations.
+  Without a key they run deterministic heuristics over the **added lines** of the diff, with `file:line` locations
+  (plain source code that is not a diff is scanned in full).
 - **synthesize** deduplicates, ranks by severity/confidence, caps at `max_findings`, and scores the change.
 - A crashing specialist doesn't sink the review: the result comes back with `status: "partial"`.
 - Every result keeps the agent trajectory in `raw_messages` and is stored in `REVIEW_DB` for replay.
+  `run_review(request, thread_id=...)` also checkpoints the final state per thread (`memory.store.load_checkpoint`),
+  and `build_review_graph(checkpointer=MemorySaver())` gives a graph with inspectable per-thread LangGraph state.
+- `agents.reviewers.code_reviewer.analyze_diff` is a LangChain tool (Pydantic input schema) that returns
+  structured findings as JSON, for use by other agents.
 - Graph nodes, LLM calls (with token usage), jobs, and HTTP requests emit OpenTelemetry spans; configure an OTel SDK/exporter to collect them.
 
 ## Quick start
@@ -63,9 +68,9 @@ review history
 |--------|------|-------|
 | GET | `/health` | Includes `llm_configured` / `github_configured` |
 | POST | `/v1/review` | Body: `ReviewRequest` (`diff`, `focus`, `max_findings`, optional `title`/`body`/`additions`/`deletions`) |
-| POST | `/v1/review/github/{owner}/{repo}/{number}?focus=security` | Needs `GITHUB_TOKEN` |
+| POST | `/v1/review/github/{owner}/{repo}/{number}?focus=security` | Needs `GITHUB_TOKEN`; focus may also be a JSON body list |
 | GET | `/v1/reviews`, `/v1/reviews/{request_id}` | Stored review history |
-| POST | `/v1/webhooks/github` | GitHub `pull_request` events; returns 202 + `job_id` |
+| POST | `/v1/webhooks/github` | GitHub `pull_request` events; returns `{"status": "queued", "job_id": ...}` |
 | GET | `/v1/jobs`, `/v1/jobs/{job_id}` | Background job status and result |
 
 ### Webhooks and safety defaults
@@ -74,7 +79,7 @@ review history
   With no secret configured they are refused, unless `ALLOW_UNSIGNED_WEBHOOKS=true` (local testing only).
 - Posting a review comment back to GitHub is opt-in: set `REVIEW_POST_COMMENTS=true`.
 - `CORS_ORIGINS=*` disables credentialed CORS. List explicit origins in production.
-- The job queue is in-process and in-memory (bounded to 500 jobs); jobs are lost on restart.
+- The job queue is in-process and in-memory, bounded by `REVIEW_MAX_JOBS` (default 500); jobs are lost on restart.
 
 ## Development
 
