@@ -19,9 +19,16 @@ type Finding = {
   severity: string;
   title: string;
   description: string;
-  file_path?: string;
-  suggestion?: string;
+  file_path?: string | null;
+  line_start?: number | null;
+  suggestion?: string | null;
   confidence?: number;
+};
+
+type PRAction = {
+  action: string;
+  body?: string | null;
+  labels?: string[] | null;
 };
 
 type ReviewResult = {
@@ -33,13 +40,16 @@ type ReviewResult = {
   score?: number;
   duration_ms?: number;
   agents_involved: string[];
-  cost_usd?: number;
+  actions?: PRAction[];
+  cost_usd?: number | null;
 };
 
 type Health = {
   status: string;
   version?: string;
   agents_ready?: string[];
+  llm_configured?: boolean;
+  github_configured?: boolean;
 };
 
 type Mode = "diff" | "github";
@@ -105,7 +115,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: mode === "diff" ? JSON.stringify({ diff, include_suggestions: true }) : undefined,
       });
-      if (!res.ok) throw new Error(await res.text());
+      if (!res.ok) throw new Error(await errorText(res));
       const data: ReviewResult = await res.json();
       setResult(data);
     } catch (e: unknown) {
@@ -180,7 +190,22 @@ export default function Home() {
                 <Metric label="Score" value={result.score == null ? "—" : String(result.score)} />
                 <Metric label="Duration" value={result.duration_ms != null ? `${result.duration_ms} ms` : "—"} />
               </div>
+              {result.status === "partial" && (
+                <div className="banner warn" role="status">Some specialists failed; findings may be incomplete.</div>
+              )}
               <p className="lede">{result.summary}</p>
+              {result.agents_involved.length > 0 && (
+                <p className="agents">Agents: {result.agents_involved.join(" · ")}</p>
+              )}
+              {(result.actions ?? []).length > 0 && (
+                <ul className="actions-list">
+                  {(result.actions ?? []).map((a, i) => (
+                    <li key={i}>
+                      <span className="cat">{a.action}</span> {a.labels?.length ? <code className="path">{a.labels.join(", ")}</code> : null} {a.body}
+                    </li>
+                  ))}
+                </ul>
+              )}
               <div className="findings-head">
                 <h2>Findings ({visible.length})</h2>
                 <div className="filters">
@@ -198,7 +223,7 @@ export default function Home() {
                         <span className={`sev sev-${f.severity}`}>{f.severity}</span>
                         <span className="cat">{f.category}</span>
                         {f.confidence != null && <span className="cat">{Math.round(f.confidence * 100)}%</span>}
-                        {f.file_path && <code className="path">{f.file_path}</code>}
+                        {f.file_path && <code className="path">{f.file_path}{f.line_start ? `:${f.line_start}` : ""}</code>}
                       </div>
                       <strong>{f.title}</strong>
                       <p>{f.description}</p>
@@ -233,6 +258,10 @@ export default function Home() {
         .primary { background: var(--accent); color: #062016; border: none; border-radius: 8px; padding: 10px 16px; font-weight: 700; }
         .pulse { color: var(--muted); }
         .banner.bad { background: #3f1d24; color: #fecaca; padding: 12px; border-radius: 8px; margin-bottom: 12px; }
+        .banner.warn { background: #3a2f12; color: #fde68a; padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; }
+        .agents { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+        .actions-list { list-style: none; padding: 0; margin: 0 0 12px; font-size: 13px; }
+        .actions-list li { padding: 6px 0; border-top: 1px dashed var(--line); }
         .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
         .lede { margin: 0 0 12px; }
         .findings-head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
@@ -285,8 +314,26 @@ function HealthPill({ health, error }: { health: Health | null; error: string | 
     <div title={error || health?.agents_ready?.join(", ") || "checking"} style={{ display: "flex", alignItems: "center", gap: 8, background: "var(--bg-elev)", border: "1px solid var(--line)", borderRadius: 999, padding: "8px 12px", fontSize: 13 }}>
       <span style={{ width: 8, height: 8, borderRadius: "50%", background: error ? "var(--danger)" : ok ? "var(--ok)" : "var(--warn)" }} />
       <span>{error ? "API offline" : ok ? `API ${health?.status} · v${health?.version ?? "?"}` : "Checking API…"}</span>
+      {ok && (
+        <span style={{ color: "var(--muted)" }}>
+          {health?.llm_configured ? "LLM" : "offline heuristics"}
+          {health?.github_configured ? " · GitHub" : ""}
+        </span>
+      )}
     </div>
   );
+}
+
+async function errorText(res: Response): Promise<string> {
+  const text = await res.text();
+  try {
+    const body = JSON.parse(text);
+    if (typeof body.detail === "string") return body.detail;
+    if (Array.isArray(body.detail)) return body.detail.map((d: { msg?: string }) => d.msg).join("; ");
+  } catch {
+    // not JSON; fall through to raw text
+  }
+  return text || `HTTP ${res.status}`;
 }
 
 function EmptyState({ mode }: { mode: Mode }) {
