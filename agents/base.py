@@ -3,23 +3,41 @@
 from __future__ import annotations
 
 import os
-from typing import Any
 
 from langchain_core.language_models import BaseChatModel
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from schemas.models import AgentRole
 
+DEFAULT_MODEL = "gpt-4o-mini"
+MAX_LLM_RETRIES = 2  # client-side retries per model; one fallback model at most on top
+
+
+def llm_available() -> bool:
+    """True when a real model can be called. Without a key, agents run offline heuristics."""
+    return bool(os.getenv("OPENAI_API_KEY"))
+
+
+def candidate_models(model: str | None = None) -> list[str]:
+    """Primary model followed by the optional REVIEW_FALLBACK_MODEL, de-duplicated."""
+    primary = model or os.getenv("REVIEW_MODEL", DEFAULT_MODEL)
+    fallback = os.getenv("REVIEW_FALLBACK_MODEL")
+    return [primary] + ([fallback] if fallback and fallback != primary else [])
+
 
 def get_llm(model: str | None = None, temperature: float = 0.1) -> BaseChatModel:
-    """Create a chat model. Falls back to a cheap model if none configured."""
-    model_name = model or os.getenv("REVIEW_MODEL", "gpt-4o-mini")
+    """Create a chat model with bounded retries and a request timeout."""
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        # Allow local / mock usage without key for scaffolding
-        return ChatOpenAI(model=model_name, temperature=temperature, api_key="sk-dummy")
-    return ChatOpenAI(model=model_name, temperature=temperature, api_key=api_key)
+        raise RuntimeError("OPENAI_API_KEY is not set")
+    return ChatOpenAI(
+        model=model or os.getenv("REVIEW_MODEL", DEFAULT_MODEL),
+        temperature=temperature,
+        api_key=api_key,
+        max_retries=MAX_LLM_RETRIES,
+        timeout=float(os.getenv("REVIEW_LLM_TIMEOUT", "60")),
+    )
 
 
 class AgentConfig(BaseModel):
@@ -27,7 +45,7 @@ class AgentConfig(BaseModel):
     name: str
     system_prompt: str
     max_iterations: int = 8
-    tools: list[str] = []
+    tools: list[str] = Field(default_factory=list)
 
 
 ROLE_PROMPTS: dict[AgentRole, str] = {
@@ -40,7 +58,8 @@ ROLE_PROMPTS: dict[AgentRole, str] = {
     AgentRole.CODE_REVIEWER: (
         "You are a senior code reviewer. Focus on correctness, readability, "
         "edge cases, error handling, and maintainability. Cite exact file:line "
-        "when possible. Prefer concrete suggestions over vague advice."
+        "when possible. Prefer concrete suggestions over vague advice. "
+        "Leave security issues to the security specialist."
     ),
     AgentRole.SECURITY_SPECIALIST: (
         "You are a security specialist. Look for injection, auth/authz flaws, "

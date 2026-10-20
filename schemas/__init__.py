@@ -1,1 +1,1 @@
-from schemas.models import *
+"""Pydantic schemas. Import from schemas.models."""

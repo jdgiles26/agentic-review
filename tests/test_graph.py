@@ -1,7 +1,18 @@
-"""Smoke tests for the review graph (no live LLM required)."""
+"""Review graph behaviour (offline, no live LLM)."""
 
-from graphs.review_graph import run_review
-from schemas.models import ReviewRequest
+import time
+
+from graphs.review_graph import plan_specialists, run_review
+from memory.store import get_review
+from schemas.models import AgentRole, ReviewCategory, ReviewRequest
+
+LEAKY_DIFF = """--- a/src/auth.py
++++ b/src/auth.py
+@@ -10,1 +10,3 @@
+     user = load(user)
++    print(password)
++    run = eval(cmd)
+"""
 
 
 def test_run_review_empty_diff():
@@ -9,17 +20,89 @@ def test_run_review_empty_diff():
     assert result.status == "completed"
     assert result.request_id
     assert result.duration_ms is not None
-    assert result.recommendation in {"approve", "request_changes", "comment"}
+    assert result.recommendation == "approve"
+    assert result.findings == []
 
 
-def test_run_review_with_focus():
-    from schemas.models import ReviewCategory
+def test_offline_review_is_fast():
+    """No network calls are attempted without an API key."""
+    start = time.perf_counter()
+    run_review(ReviewRequest(diff=LEAKY_DIFF))
+    assert time.perf_counter() - start < 2.0
 
-    result = run_review(
-        ReviewRequest(
-            diff="+ print('hello')\n",
-            focus=[ReviewCategory.SECURITY, ReviewCategory.CORRECTNESS],
-        )
-    )
+
+def test_run_review_with_focus_limits_specialists():
+    result = run_review(ReviewRequest(diff="+ print('hello')\n", focus=[ReviewCategory.SECURITY]))
     assert result.status == "completed"
-    assert len(result.agents_involved) >= 1
+    assert AgentRole.SECURITY_SPECIALIST in result.agents_involved
+    assert AgentRole.STYLE_LINTER not in result.agents_involved
+    assert AgentRole.SUPERVISOR in result.agents_involved
+
+
+def test_plan_without_focus_runs_every_specialist():
+    plan = plan_specialists([])
+    assert set(plan) == {
+        AgentRole.CODE_REVIEWER,
+        AgentRole.SECURITY_SPECIALIST,
+        AgentRole.ARCHITECTURE_REVIEWER,
+        AgentRole.TEST_SPECIALIST,
+        AgentRole.STYLE_LINTER,
+        AgentRole.PR_SPECIALIST,
+    }
+
+
+def test_critical_finding_requests_changes_and_findings_sorted():
+    result = run_review(ReviewRequest(diff=LEAKY_DIFF))
+    assert result.recommendation == "request_changes"
+    assert result.findings[0].severity.value == "critical"
+    severities = [f.severity.value for f in result.findings]
+    order = ["critical", "high", "medium", "low", "info"]
+    assert severities == sorted(severities, key=order.index)
+
+
+def test_findings_are_deduplicated():
+    result = run_review(ReviewRequest(diff=LEAKY_DIFF))
+    keys = [(f.title, f.file_path, f.line_start) for f in result.findings]
+    assert len(keys) == len(set(keys))
+
+
+def test_max_findings_caps_result():
+    body = "".join(f"+v{i} = eval(x)\n" for i in range(30))
+    diff = f"--- a/m.py\n+++ b/m.py\n@@ -0,0 +1,30 @@\n{body}"
+    result = run_review(ReviewRequest(diff=diff, max_findings=5))
+    assert len(result.findings) == 5
+
+
+def test_pr_metadata_reaches_pr_specialist():
+    result = run_review(ReviewRequest(diff="+x = 1\n", title="Add x", body="", additions=900, deletions=10))
+    kinds = {a.action for a in result.actions}
+    assert "label" in kinds  # size/XL
+    assert "comment" in kinds  # thin description
+
+
+def test_trajectory_is_recorded_for_replay():
+    result = run_review(ReviewRequest(diff=LEAKY_DIFF))
+    roles = {m.role for m in result.raw_messages}
+    assert AgentRole.SUPERVISOR in roles
+    assert AgentRole.SECURITY_SPECIALIST in roles
+
+
+def test_review_is_persisted():
+    result = run_review(ReviewRequest(diff="+    print(password)\n"))
+    saved = get_review(result.request_id)
+    assert saved is not None
+    assert saved["request_id"] == result.request_id
+    assert saved["recommendation"] == result.recommendation
+
+
+def test_failing_specialist_marks_review_partial(monkeypatch):
+    from graphs import review_graph
+
+    def boom(*_args, **_kwargs):
+        raise RuntimeError("specialist crashed")
+
+    monkeypatch.setitem(review_graph.RUNNERS, AgentRole.STYLE_LINTER, boom)
+    result = run_review(ReviewRequest(diff=LEAKY_DIFF))
+    assert result.status == "partial"
+    assert any("specialist crashed" in m.content for m in result.raw_messages)
+    assert result.findings  # other specialists still reported

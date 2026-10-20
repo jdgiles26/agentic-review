@@ -1,16 +1,32 @@
-"""In-process background job queue for webhook-triggered reviews."""
+"""In-process background job queue for webhook-triggered reviews.
+
+Jobs live in memory and are lost on restart; the registry is bounded so a busy
+webhook cannot grow it without limit. Posting results back to GitHub is an
+outward-facing action and is gated behind REVIEW_POST_COMMENTS=true.
+"""
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
+import os
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from graphs.review_graph import run_review
-from schemas.models import ReviewRequest
+from schemas.models import JobView, ReviewCategory
 from tools.github.client import GitHubClient
+from tools.github.pr_context import build_pr_review_request, format_review_comment
+from tools.tracing import span
+
+log = logging.getLogger(__name__)
+
+MAX_JOBS = 500
+JobStatus = Literal["queued", "running", "completed", "failed"]
 
 
 @dataclass
@@ -18,17 +34,35 @@ class Job:
     id: str
     kind: str
     payload: dict[str, Any]
-    status: str = "queued"
+    status: JobStatus = "queued"
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
     result: dict[str, Any] | None = None
+    comment_url: str | None = None
     error: str | None = None
 
+    def view(self) -> JobView:
+        return JobView(
+            id=self.id,
+            kind=self.kind,
+            status=self.status,
+            error=self.error,
+            result=self.result,
+            comment_url=self.comment_url,
+            created_at=self.created_at,
+            started_at=self.started_at,
+            finished_at=self.finished_at,
+        )
 
-_jobs: dict[str, Job] = {}
+
+_jobs: OrderedDict[str, Job] = OrderedDict()
 _queue: asyncio.Queue[str] | None = None
 _worker: asyncio.Task | None = None
+
+
+def posting_enabled() -> bool:
+    return os.getenv("REVIEW_POST_COMMENTS", "").lower() in {"1", "true", "yes"}
 
 
 def get_job(job_id: str) -> Job | None:
@@ -39,16 +73,31 @@ def list_jobs(limit: int = 20) -> list[Job]:
     return sorted(_jobs.values(), key=lambda j: j.created_at, reverse=True)[:limit]
 
 
+def _register(job: Job) -> None:
+    _jobs[job.id] = job
+    if len(_jobs) <= MAX_JOBS:
+        return
+    # Drop the oldest finished jobs first; never drop work that is still pending.
+    for job_id in [j for j, v in _jobs.items() if v.status in {"completed", "failed"}]:
+        if len(_jobs) <= MAX_JOBS:
+            break
+        del _jobs[job_id]
+
+
+def reset() -> None:
+    _jobs.clear()
+
+
 def enqueue(kind: str, payload: dict[str, Any]) -> Job:
     if _queue is None:
         raise RuntimeError("Job queue is not started")
     job = Job(id=str(uuid.uuid4()), kind=kind, payload=payload)
-    _jobs[job.id] = job
+    _register(job)
     _queue.put_nowait(job.id)
     return job
 
 
-def _execute(job: Job) -> dict[str, Any]:
+def _execute(job: Job) -> None:
     if job.kind != "github_pr_review":
         raise ValueError(f"Unknown job kind: {job.kind}")
     owner = job.payload["owner"]
@@ -57,39 +106,35 @@ def _execute(job: Job) -> dict[str, Any]:
     client = GitHubClient()
     if not client.available:
         raise RuntimeError("GITHUB_TOKEN not configured")
-    pr = client.get_pr(owner, repo, number)
-    diff = client.get_pr_diff(owner, repo, number)
-    req = ReviewRequest(
-        repo_url=f"https://github.com/{owner}/{repo}",
-        pr_number=number,
-        diff=diff,
-        files=pr.get("files"),
-    )
-    result = run_review(req)
-    if job.payload.get("post_comment") and result.summary:
-        client.post_comment(owner, repo, number, result.summary)
-    return result.model_dump(mode="json")
+    focus = [ReviewCategory(c) for c in job.payload.get("focus") or []]
+    result = run_review(build_pr_review_request(client, owner, repo, number, focus=focus))
+    job.result = result.model_dump(mode="json")
+    if job.payload.get("post_comment"):
+        job.comment_url = client.post_comment(owner, repo, number, format_review_comment(result))
 
 
 async def _worker_loop() -> None:
     assert _queue is not None
+    queue = _queue
     while True:
-        job_id = await _queue.get()
+        job_id = await queue.get()
         job = _jobs.get(job_id)
         if not job:
-            _queue.task_done()
+            queue.task_done()
             continue
         job.status = "running"
         job.started_at = time.time()
         try:
-            job.result = await asyncio.to_thread(_execute, job)
+            with span("review.job", **{"job.id": job.id, "job.kind": job.kind}):
+                await asyncio.to_thread(_execute, job)
             job.status = "completed"
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001 - recorded on the job for the caller
+            log.exception("Job %s failed", job.id)
             job.status = "failed"
             job.error = str(exc)
         finally:
             job.finished_at = time.time()
-            _queue.task_done()
+            queue.task_done()
 
 
 async def start_queue() -> None:
@@ -104,5 +149,7 @@ async def stop_queue() -> None:
     global _worker, _queue
     if _worker:
         _worker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await _worker
         _worker = None
     _queue = None

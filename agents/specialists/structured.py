@@ -1,12 +1,13 @@
 """Shared structured-output runner for specialist agents.
 
-Uses LangChain structured output when OPENAI_API_KEY is set.
-Falls back to deterministic heuristics so CI and offline runs still produce findings.
+Uses LangChain structured output when OPENAI_API_KEY is set, trying the primary
+model then REVIEW_FALLBACK_MODEL. Falls back to deterministic heuristics so CI
+and offline runs still produce findings.
 """
 
 from __future__ import annotations
 
-import os
+import logging
 import re
 import uuid
 from typing import Any
@@ -14,8 +15,15 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from agents.base import ROLE_PROMPTS, get_llm
+from agents.base import ROLE_PROMPTS, candidate_models, get_llm, llm_available
 from schemas.models import AgentRole, Finding, ReviewCategory, Severity
+from tools.diff import AddedLine, changed_files, parse_added_lines
+from tools.tracing import record_token_usage, span
+
+log = logging.getLogger(__name__)
+
+MAX_DIFF_CHARS = 12_000
+LARGE_DIFF_LINES = 800
 
 
 class FindingDraft(BaseModel):
@@ -27,7 +35,7 @@ class FindingDraft(BaseModel):
     line_start: int | None = None
     line_end: int | None = None
     suggestion: str | None = None
-    confidence: float = 0.8
+    confidence: float = Field(default=0.8, ge=0.0, le=1.0)
 
 
 class FindingBatch(BaseModel):
@@ -42,36 +50,42 @@ def _new_id(prefix: str) -> str:
 
 
 def _to_findings(batch: FindingBatch, role: AgentRole) -> list[Finding]:
-    out: list[Finding] = []
-    for draft in batch.findings:
-        out.append(
-            Finding(
-                id=_new_id(role.value),
-                category=draft.category,
-                severity=draft.severity,
-                title=draft.title,
-                description=draft.description,
-                file_path=draft.file_path,
-                line_start=draft.line_start,
-                line_end=draft.line_end,
-                suggestion=draft.suggestion,
-                confidence=draft.confidence,
-            )
-        )
-    return out
+    return [Finding(id=_new_id(role.value), **draft.model_dump()) for draft in batch.findings]
 
 
-def heuristic_findings(diff: str, role: AgentRole) -> list[Finding]:
-    """Cheap offline signals so reviews are useful without a live model."""
-    if not diff.strip():
-        return []
-    text = diff.lower()
+def _at(line: AddedLine, **fields: Any) -> Finding:
+    return Finding(
+        file_path=line.file_path,
+        line_start=line.line_no,
+        line_end=line.line_no,
+        **fields,
+    )
+
+
+_DYNAMIC_EXEC = re.compile(r"\b(eval|exec)\s*\(")
+_HARDCODED_SECRET = re.compile(
+    r"(api[_-]?key|secret|password|passwd|token)\w*\s*[:=]\s*['\"][^'\"]{3,}['\"]", re.IGNORECASE
+)
+_LOGGED_SECRET = re.compile(
+    r"\b(print|console\.log|log(?:ger)?\.\w+|logging\.\w+)\s*\(.*\b(password|passwd|token|secret)",
+    re.IGNORECASE,
+)
+_TODO = re.compile(r"\b(TODO|FIXME|XXX)\b")
+_TEST_PATH = re.compile(r"(^|/)(tests?|__tests__|spec)/|(^|/)test_[^/]*$|_test\.\w+$|\.(spec|test)\.\w+$")
+_NEW_LOGIC = re.compile(r"^\s*(async\s+def|def|function|class)\s+\w+|=>\s*\{")
+
+
+def _is_test_path(path: str | None) -> bool:
+    return bool(path) and bool(_TEST_PATH.search(path or ""))
+
+
+def _security_heuristics(added: list[AddedLine]) -> list[Finding]:
     found: list[Finding] = []
-
-    if role in {AgentRole.CODE_REVIEWER, AgentRole.SECURITY_SPECIALIST}:
-        if re.search(r"\b(eval|exec)\s*\(", diff):
+    for line in added:
+        if _DYNAMIC_EXEC.search(line.text):
             found.append(
-                Finding(
+                _at(
+                    line,
                     id=_new_id("sec"),
                     category=ReviewCategory.SECURITY,
                     severity=Severity.CRITICAL,
@@ -81,9 +95,10 @@ def heuristic_findings(diff: str, role: AgentRole) -> list[Finding]:
                     confidence=0.9,
                 )
             )
-        if re.search(r"(api[_-]?key|secret|password|token)\s*=\s*['\"][^'\"]+['\"]", text):
+        if _HARDCODED_SECRET.search(line.text) and not _is_test_path(line.file_path):
             found.append(
-                Finding(
+                _at(
+                    line,
                     id=_new_id("sec"),
                     category=ReviewCategory.SECURITY,
                     severity=Severity.HIGH,
@@ -93,9 +108,10 @@ def heuristic_findings(diff: str, role: AgentRole) -> list[Finding]:
                     confidence=0.85,
                 )
             )
-        if "print(password" in text or "print(token" in text:
+        if _LOGGED_SECRET.search(line.text):
             found.append(
-                Finding(
+                _at(
+                    line,
                     id=_new_id("sec"),
                     category=ReviewCategory.SECURITY,
                     severity=Severity.HIGH,
@@ -105,48 +121,97 @@ def heuristic_findings(diff: str, role: AgentRole) -> list[Finding]:
                     confidence=0.92,
                 )
             )
-
-    if role == AgentRole.TEST_SPECIALIST and ("def " in diff or "function " in diff):
-        if "test" not in text and "assert" not in text:
-            found.append(
-                Finding(
-                    id=_new_id("test"),
-                    category=ReviewCategory.TEST_COVERAGE,
-                    severity=Severity.MEDIUM,
-                    title="New logic without tests",
-                    description="Diff adds behavior but no test or assert appears in the patch.",
-                    suggestion="Add a unit test covering the happy path and one failure mode.",
-                    confidence=0.6,
-                )
-            )
-
-    if role == AgentRole.STYLE_LINTER and re.search(r"TODO|FIXME|xxx", diff):
-        found.append(
-            Finding(
-                id=_new_id("style"),
-                category=ReviewCategory.STYLE,
-                severity=Severity.LOW,
-                title="Unresolved TODO",
-                description="TODO/FIXME left in the change.",
-                suggestion="Track it as an issue or remove it before merge.",
-                confidence=0.7,
-            )
-        )
-
-    if role == AgentRole.ARCHITECTURE_REVIEWER and len(diff) > 8000:
-        found.append(
-            Finding(
-                id=_new_id("arch"),
-                category=ReviewCategory.ARCHITECTURE,
-                severity=Severity.MEDIUM,
-                title="Large cross-cutting change",
-                description="Patch is large enough that module boundaries may have shifted.",
-                suggestion="Confirm the change stays inside the owning package.",
-                confidence=0.5,
-            )
-        )
-
     return found
+
+
+def _test_heuristics(added: list[AddedLine], diff: str) -> list[Finding]:
+    files = changed_files(diff) or [line.file_path for line in added if line.file_path]
+    if any(_is_test_path(f) for f in files):
+        return []
+    logic = [line for line in added if _NEW_LOGIC.search(line.text) and not _is_test_path(line.file_path)]
+    if not logic or any("assert" in line.text for line in added):
+        return []
+    return [
+        _at(
+            logic[0],
+            id=_new_id("test"),
+            category=ReviewCategory.TEST_COVERAGE,
+            severity=Severity.MEDIUM,
+            title="New logic without tests",
+            description="Diff adds behavior but touches no test file and adds no assertion.",
+            suggestion="Add a unit test covering the happy path and one failure mode.",
+            confidence=0.6,
+        )
+    ]
+
+
+def _style_heuristics(added: list[AddedLine]) -> list[Finding]:
+    return [
+        _at(
+            line,
+            id=_new_id("style"),
+            category=ReviewCategory.STYLE,
+            severity=Severity.LOW,
+            title="Unresolved TODO",
+            description="TODO/FIXME left in the change.",
+            suggestion="Track it as an issue or remove it before merge.",
+            confidence=0.7,
+        )
+        for line in added
+        if _TODO.search(line.text)
+    ]
+
+
+def _architecture_heuristics(added: list[AddedLine]) -> list[Finding]:
+    if len(added) <= LARGE_DIFF_LINES:
+        return []
+    return [
+        Finding(
+            id=_new_id("arch"),
+            category=ReviewCategory.ARCHITECTURE,
+            severity=Severity.MEDIUM,
+            title="Large cross-cutting change",
+            description=f"Patch adds {len(added)} lines; module boundaries may have shifted.",
+            suggestion="Confirm the change stays inside the owning package, or split it.",
+            confidence=0.5,
+        )
+    ]
+
+
+def heuristic_findings(diff: str, role: AgentRole) -> list[Finding]:
+    """Cheap offline signals over added lines only, so reviews are useful without a model.
+
+    Each heuristic belongs to exactly one specialist so the graph never double-reports.
+    """
+    if not diff.strip():
+        return []
+    added = parse_added_lines(diff)
+    if role == AgentRole.SECURITY_SPECIALIST:
+        return _security_heuristics(added)
+    if role == AgentRole.TEST_SPECIALIST:
+        return _test_heuristics(added, diff)
+    if role == AgentRole.STYLE_LINTER:
+        return _style_heuristics(added)
+    if role == AgentRole.ARCHITECTURE_REVIEWER:
+        return _architecture_heuristics(added)
+    return []
+
+
+def _invoke_structured(role: AgentRole, model: str, prompt: str) -> list[Finding]:
+    with span("llm.structured_review", **{"agent.role": role.value, "llm.model": model}) as current:
+        structured = get_llm(model).with_structured_output(FindingBatch, include_raw=True)
+        response: Any = structured.invoke([SystemMessage(content=ROLE_PROMPTS[role]), HumanMessage(content=prompt)])
+        raw = response.get("raw") if isinstance(response, dict) else None
+        record_token_usage(current, getattr(raw, "usage_metadata", None))
+        if isinstance(response, dict) and response.get("parsing_error"):
+            raise ValueError(f"structured output parse failed: {response['parsing_error']}")
+        parsed = response.get("parsed") if isinstance(response, dict) else response
+        if isinstance(parsed, dict):
+            parsed = FindingBatch(**parsed)
+        if not isinstance(parsed, FindingBatch):
+            raise ValueError(f"unexpected structured output type: {type(parsed).__name__}")
+        current.set_attribute("review.findings", len(parsed.findings))
+        return _to_findings(parsed, role)
 
 
 def run_structured_review(
@@ -158,28 +223,21 @@ def run_structured_review(
 ) -> list[Finding]:
     """Return structured findings for one specialist."""
     offline = heuristic_findings(diff, role)
-    if not os.getenv("OPENAI_API_KEY"):
+    if not llm_available() or not diff.strip():
         return offline[:max_findings]
 
-    llm = get_llm(model)
     prompt = (
-        f"{ROLE_PROMPTS[role]}\n\n"
-        "Return only structured findings. Do not invent issues. "
-        "If nothing material, return an empty findings list.\n"
+        "Return only structured findings for the diff below. Do not invent issues. "
+        "If nothing material, return an empty findings list. "
+        "file_path and line_start must refer to the new side of the diff.\n"
         f"{extra_context}\n\n"
-        f"```diff\n{diff[:12000]}\n```"
+        f"```diff\n{diff[:MAX_DIFF_CHARS]}\n```"
     )
-    try:
-        structured = llm.with_structured_output(FindingBatch)
-        batch: FindingBatch | Any = structured.invoke(
-            [SystemMessage(content=ROLE_PROMPTS[role]), HumanMessage(content=prompt)]
-        )
-        if isinstance(batch, FindingBatch):
-            llm_findings = _to_findings(batch, role)
-        elif isinstance(batch, dict):
-            llm_findings = _to_findings(FindingBatch(**batch), role)
-        else:
-            llm_findings = []
+    for candidate in candidate_models(model):
+        try:
+            llm_findings = _invoke_structured(role, candidate, prompt)
+        except Exception as exc:  # noqa: BLE001 - any provider failure moves to the next model
+            log.warning("%s review failed on %s: %s", role.value, candidate, exc)
+            continue
         return (llm_findings or offline)[:max_findings]
-    except Exception:
-        return offline[:max_findings]
+    return offline[:max_findings]
