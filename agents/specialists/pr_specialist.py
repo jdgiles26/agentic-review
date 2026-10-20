@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 
-from agents.base import ROLE_PROMPTS, get_llm, llm_available
+from agents.base import ROLE_PROMPTS, UNTRUSTED_CONTENT_NOTE, fence, get_llm, llm_available
 from schemas.models import AgentRole, PRAction
 from tools.tracing import record_token_usage, span
 
@@ -54,8 +54,9 @@ def evaluate_pr(
     prompt = (
         f"{ROLE_PROMPTS[AgentRole.PR_SPECIALIST]}\n\n"
         "Write a short review summary (3-6 sentences) for this pull request.\n"
-        f"Title: {title}\n"
-        f"Body:\n{body or '(empty)'}\n"
+        f"{UNTRUSTED_CONTENT_NOTE}\n"
+        f"Title:\n{fence(title)}\n"
+        f"Body:\n{fence(body or '(empty)')}\n"
         f"Files changed: {len(changed_files)}\n"
         f"+{additions} -{deletions}\n"
         f"Sample files: {changed_files[:15]}"

@@ -1,7 +1,8 @@
 """In-process background job queue for webhook-triggered reviews.
 
-Jobs live in memory and are lost on restart; the registry is bounded so a busy
-webhook cannot grow it without limit. Posting results back to GitHub is an
+Jobs live in memory and are lost on restart. The pending queue holds at most
+MAX_JOBS jobs (further webhooks get 503) and finished jobs are pruned, so a busy
+webhook cannot grow memory without limit. Posting results back to GitHub is an
 outward-facing action and is gated behind REVIEW_POST_COMMENTS=true.
 """
 
@@ -92,8 +93,11 @@ def enqueue(kind: str, payload: dict[str, Any]) -> Job:
     if _queue is None:
         raise RuntimeError("Job queue is not started")
     job = Job(id=str(uuid.uuid4()), kind=kind, payload=payload)
+    try:
+        _queue.put_nowait(job.id)
+    except asyncio.QueueFull as exc:
+        raise RuntimeError("Job queue is full, try again later") from exc
     _register(job)
-    _queue.put_nowait(job.id)
     return job
 
 
@@ -141,7 +145,7 @@ async def start_queue() -> None:
     global _queue, _worker
     if _queue is not None:
         return
-    _queue = asyncio.Queue()
+    _queue = asyncio.Queue(maxsize=MAX_JOBS)
     _worker = asyncio.create_task(_worker_loop())
 
 

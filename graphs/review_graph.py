@@ -188,15 +188,19 @@ def _synthesize_node(state: ReviewState) -> dict[str, Any]:
     unique: dict[tuple[Any, ...], dict[str, Any]] = {}
     for f in state.get("findings") or []:
         key = _dedupe_key(f)
-        if key not in unique or f.get("confidence", 0) > unique[key].get("confidence", 0):
+        # Most severe wins, then most confident, so dedupe never downgrades a finding.
+        if key not in unique or _rank(f) < _rank(unique[key]):
             unique[key] = f
-    ranked = sorted(unique.values(), key=_rank)[: state["request"]["max_findings"]]
-    rec, score = _score(ranked)
+    every = sorted(unique.values(), key=_rank)
+    ranked = every[: state["request"]["max_findings"]]
+    # The verdict covers every finding; max_findings only limits what is reported.
+    rec, score = _score(every)
 
-    n_critical = sum(1 for f in ranked if f.get("severity") == "critical")
-    n_high = sum(1 for f in ranked if f.get("severity") == "high")
+    n_critical = sum(1 for f in every if f.get("severity") == "critical")
+    n_high = sum(1 for f in every if f.get("severity") == "high")
+    shown = f", showing {len(ranked)}" if len(ranked) < len(every) else ""
     summary = state.get("pr_summary") or (
-        f"Review complete. {len(ranked)} findings ({n_critical} critical, {n_high} high)."
+        f"Review complete. {len(every)} findings ({n_critical} critical, {n_high} high{shown})."
     )
     errors = state.get("errors") or []
     if errors:

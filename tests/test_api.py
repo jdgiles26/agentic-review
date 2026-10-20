@@ -226,3 +226,23 @@ def test_webhook_rejects_non_object_payload(client, monkeypatch):
     for body in (b"[1, 2]", b"not json"):
         res = client.post("/v1/webhooks/github", content=body, headers={"X-GitHub-Event": "pull_request"})
         assert res.status_code == 400
+
+
+def test_queue_rejects_when_full(monkeypatch):
+    import asyncio
+
+    async def scenario():
+        jobs.reset()
+        monkeypatch.setattr(jobs, "MAX_JOBS", 2)
+        jobs._queue = asyncio.Queue(maxsize=jobs.MAX_JOBS)
+        try:
+            jobs.enqueue("github_pr_review", {})
+            jobs.enqueue("github_pr_review", {})
+            with pytest.raises(RuntimeError, match="full"):
+                jobs.enqueue("github_pr_review", {})
+            assert len(jobs.list_jobs(limit=100)) == 2
+        finally:
+            jobs._queue = None
+            jobs.reset()
+
+    asyncio.run(scenario())

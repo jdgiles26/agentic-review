@@ -15,7 +15,7 @@ from typing import Any
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from agents.base import ROLE_PROMPTS, candidate_models, get_llm, llm_available
+from agents.base import ROLE_PROMPTS, UNTRUSTED_CONTENT_NOTE, candidate_models, fence, get_llm, llm_available
 from schemas.models import AgentRole, Finding, ReviewCategory, Severity
 from tools.diff import AddedLine, changed_files, parse_added_lines
 from tools.tracing import record_token_usage, span
@@ -226,12 +226,15 @@ def run_structured_review(
     if not llm_available() or not diff.strip():
         return offline[:max_findings]
 
+    truncated = len(diff) > MAX_DIFF_CHARS
     prompt = (
         "Return only structured findings for the diff below. Do not invent issues. "
         "If nothing material, return an empty findings list. "
         "file_path and line_start must refer to the new side of the diff.\n"
-        f"{extra_context}\n\n"
-        f"```diff\n{diff[:MAX_DIFF_CHARS]}\n```"
+        f"{UNTRUSTED_CONTENT_NOTE}\n"
+        + (f"The diff was truncated to its first {MAX_DIFF_CHARS} characters.\n" if truncated else "")
+        + f"{extra_context}\n\n"
+        + fence(diff[:MAX_DIFF_CHARS], "diff")
     )
     for candidate in candidate_models(model):
         try:
@@ -239,5 +242,8 @@ def run_structured_review(
         except Exception as exc:  # noqa: BLE001 - any provider failure moves to the next model
             log.warning("%s review failed on %s: %s", role.value, candidate, exc)
             continue
+        if truncated:
+            # The model never saw the tail; keep heuristic coverage of it (synthesize dedupes).
+            return (llm_findings + offline)[:max_findings]
         return (llm_findings or offline)[:max_findings]
     return offline[:max_findings]

@@ -106,3 +106,38 @@ def test_failing_specialist_marks_review_partial(monkeypatch):
     assert result.status == "partial"
     assert any("specialist crashed" in m.content for m in result.raw_messages)
     assert result.findings  # other specialists still reported
+
+
+def _state(findings, max_findings=50):
+    return {"request": {"max_findings": max_findings}, "findings": findings}
+
+
+def _f(severity, confidence, title="Same", line=1):
+    return {
+        "id": f"{severity}-{confidence}",
+        "category": "security",
+        "severity": severity,
+        "title": title,
+        "description": "d",
+        "file_path": "a.py",
+        "line_start": line,
+        "confidence": confidence,
+    }
+
+
+def test_dedupe_keeps_most_severe_duplicate():
+    from graphs.review_graph import _synthesize_node
+
+    out = _synthesize_node(_state([_f("critical", 0.6), _f("low", 0.9)]))
+    assert [f["severity"] for f in out["final_findings"]] == ["critical"]
+    assert out["recommendation"] == "request_changes"
+
+
+def test_verdict_uses_all_findings_not_the_capped_list():
+    from graphs.review_graph import _synthesize_node
+
+    highs = [_f("high", 0.8, title=f"H{i}", line=i) for i in range(4)]
+    out = _synthesize_node(_state(highs, max_findings=2))
+    assert len(out["final_findings"]) == 2
+    assert out["recommendation"] == "request_changes"
+    assert "4 findings" in out["summary"]
