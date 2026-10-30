@@ -148,14 +148,15 @@ export default function Home() {
         <div>
           <p className="eyebrow">Multi-agent review</p>
           <h1>Review Console</h1>
+          <p className="subtitle">Paste a diff or pull a GitHub PR. Agents return findings with severity and confidence.</p>
         </div>
         <HealthPill health={health} error={healthError} />
       </header>
       <div className="layout">
         <section className="panel">
-          <div className="tabs">
-            <button type="button" aria-pressed={mode === "diff"} className={mode === "diff" ? "tab on" : "tab"} onClick={() => setMode("diff")}>Paste diff</button>
-            <button type="button" aria-pressed={mode === "github"} className={mode === "github" ? "tab on" : "tab"} onClick={() => setMode("github")}>GitHub PR</button>
+          <div className="tabs" role="tablist" aria-label="Review source">
+            <button type="button" role="tab" aria-selected={mode === "diff"} className={mode === "diff" ? "tab on" : "tab"} onClick={() => setMode("diff")}>Paste diff</button>
+            <button type="button" role="tab" aria-selected={mode === "github"} className={mode === "github" ? "tab on" : "tab"} onClick={() => setMode("github")}>GitHub PR</button>
           </div>
           {mode === "diff" ? (
             <>
@@ -170,18 +171,23 @@ export default function Home() {
               <Field label="Owner" value={owner} onChange={setOwner} placeholder="jdgiles26" />
               <Field label="Repo" value={repo} onChange={setRepo} placeholder="agentic-review" />
               <Field label="PR #" value={prNumber} onChange={setPrNumber} placeholder="42" inputMode="numeric" />
+              <p className="hint">
+                Uses <code>POST /v1/review/github/{"{owner}/{repo}/{number}"}</code>. Requires <code>GITHUB_TOKEN</code> on the API
+                {health ? (health.github_configured ? " (configured)." : " (not configured on this API).") : "."}
+              </p>
             </div>
           )}
           <div className="actions">
             <button className="primary" onClick={runReview} disabled={!canRun}>
-              {loading ? "Running agents…" : mode === "diff" ? "Run review" : "Review PR"}
+              {loading ? "Running agents…" : mode === "diff" ? "Run review" : "Fetch PR and review"}
             </button>
+            {loading && <span className="pulse">Supervisor → specialists → merge findings</span>}
           </div>
         </section>
         <section className="panel">
           {error && <div className="banner bad" role="alert"><strong>Review failed.</strong> {error}</div>}
           {!result && !error && !loading && <EmptyState mode={mode} />}
-          {loading && <p className="pulse">Agents reviewing…</p>}
+          {loading && <p className="pulse loading">Agents reviewing… findings will group by severity when the graph finishes.</p>}
           {result && (
             <>
               <div className="metrics">
@@ -195,7 +201,11 @@ export default function Home() {
               )}
               <p className="lede">{result.summary}</p>
               {result.agents_involved.length > 0 && (
-                <p className="agents">Agents: {result.agents_involved.join(" · ")}</p>
+                <div className="chips" aria-label="Agents involved">
+                  {result.agents_involved.map((a) => (
+                    <span key={a} className="chip">{a}</span>
+                  ))}
+                </div>
               )}
               {(result.actions ?? []).length > 0 && (
                 <ul className="actions-list">
@@ -222,8 +232,8 @@ export default function Home() {
                       <div className="finding-meta">
                         <span className={`sev sev-${f.severity}`}>{f.severity}</span>
                         <span className="cat">{f.category}</span>
-                        {f.confidence != null && <span className="cat">{Math.round(f.confidence * 100)}%</span>}
                         {f.file_path && <code className="path">{f.file_path}{f.line_start ? `:${f.line_start}` : ""}</code>}
+                        {f.confidence != null && <span className="conf">{Math.round(f.confidence * 100)}% confidence</span>}
                       </div>
                       <strong>{f.title}</strong>
                       <p>{f.description}</p>
@@ -236,12 +246,13 @@ export default function Home() {
           )}
         </section>
       </div>
-      <footer className="foot">API <code>{API}/docs</code></footer>
+      <footer className="foot">API <code>{API}/docs</code> · CLI <code>review diff file.patch</code></footer>
       <style jsx>{`
         .shell { max-width: 1180px; margin: 0 auto; padding: 24px 20px 48px; }
-        .topbar { display: flex; justify-content: space-between; gap: 16px; margin-bottom: 24px; }
+        .topbar { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: 16px; margin-bottom: 24px; }
         .eyebrow { margin: 0 0 4px; color: var(--muted); font-size: 12px; letter-spacing: 0.08em; text-transform: uppercase; }
-        h1 { margin: 0; font-size: 28px; }
+        h1 { margin: 0; font-size: 28px; letter-spacing: -0.03em; }
+        .subtitle { margin: 4px 0 0; color: var(--muted); }
         .layout { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr); gap: 16px; }
         @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
         .panel { background: var(--bg-elev); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px; min-height: 420px; }
@@ -249,27 +260,33 @@ export default function Home() {
         .tab { background: var(--bg-soft); border: 1px solid var(--line); border-radius: 999px; padding: 6px 12px; color: var(--muted); }
         .tab.on { color: var(--bg); background: var(--accent); border-color: var(--accent); font-weight: 600; }
         .label-row { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-        label { display: block; font-weight: 600; margin-bottom: 8px; font-size: 13px; }
-        textarea, input { width: 100%; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 12px; color: var(--text); }
         textarea { font-family: ui-monospace, monospace; font-size: 13px; min-height: 280px; resize: vertical; }
-        .pr-grid { display: grid; gap: 12px; }
+        .pr-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 96px); gap: 12px; }
+        @media (max-width: 600px) { .pr-grid { grid-template-columns: 1fr; } }
+        .hint { grid-column: 1 / -1; color: var(--muted); font-size: 13px; margin: 0; overflow-wrap: anywhere; }
         .ghost { background: transparent; border: 1px solid var(--line); border-radius: 8px; padding: 4px 10px; color: var(--accent-2); font-size: 13px; }
-        .actions { margin-top: 16px; }
+        .actions { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 16px; }
         .primary { background: var(--accent); color: #062016; border: none; border-radius: 8px; padding: 10px 16px; font-weight: 700; }
-        .pulse { color: var(--muted); }
+        .pulse { color: var(--muted); font-size: 13px; }
+        .pulse.loading { font-size: 14px; padding: 32px 8px; margin: 0; }
         .banner.bad { background: #3f1d24; color: #fecaca; padding: 12px; border-radius: 8px; margin-bottom: 12px; }
         .banner.warn { background: #3a2f12; color: #fde68a; padding: 10px 12px; border-radius: 8px; margin-bottom: 12px; }
-        .agents { margin: 0 0 12px; color: var(--muted); font-size: 13px; }
+        .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 0 0 12px; }
+        .chip { font-size: 12px; background: var(--bg-soft); border: 1px solid var(--line); border-radius: 999px; padding: 2px 8px; color: var(--muted); }
         .actions-list { list-style: none; padding: 0; margin: 0 0 12px; font-size: 13px; }
         .actions-list li { padding: 6px 0; border-top: 1px dashed var(--line); }
         .metrics { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-bottom: 12px; }
+        @media (max-width: 700px) { .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
         .lede { margin: 0 0 12px; }
         .findings-head { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
         h2 { margin: 0; font-size: 16px; }
         .filters { display: flex; flex-wrap: wrap; gap: 6px; }
         .findings { list-style: none; padding: 0; margin: 12px 0 0; }
         .finding { border: 1px solid var(--line); border-radius: 8px; padding: 12px; margin-bottom: 8px; background: var(--bg-soft); }
-        .finding-meta { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+        .finding-meta { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-bottom: 6px; }
+        .finding p { margin: 6px 0 0; font-size: 14px; color: #d5dbe6; }
+        .finding pre { background: var(--bg); padding: 8px; border-radius: 6px; overflow: auto; white-space: pre-wrap; font-size: 12px; border: 1px solid var(--line); }
+        .conf { margin-left: auto; font-size: 12px; color: var(--accent-2); }
         .sev { font-size: 11px; font-weight: 700; text-transform: uppercase; padding: 2px 6px; border-radius: 4px; color: #0b0d12; }
         .sev-critical { background: #f87171; } .sev-high { background: #fb923c; } .sev-medium { background: #fbbf24; } .sev-low { background: #7dd3fc; } .sev-info { background: #94a3b8; }
         .cat { font-size: 12px; color: var(--muted); }
@@ -311,13 +328,14 @@ function FilterChip({ label, count, active, onClick }: { label: string; count: n
 function HealthPill({ health, error }: { health: Health | null; error: string | null }) {
   const ok = Boolean(health && !error);
   return (
-    <div title={error || health?.agents_ready?.join(", ") || "checking"} style={{ display: "flex", alignItems: "center", gap: 8, background: "var(--bg-elev)", border: "1px solid var(--line)", borderRadius: 999, padding: "8px 12px", fontSize: 13 }}>
-      <span style={{ width: 8, height: 8, borderRadius: "50%", background: error ? "var(--danger)" : ok ? "var(--ok)" : "var(--warn)" }} />
+    <div title={error || health?.agents_ready?.join(", ") || "checking"} style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: "4px 8px", background: "var(--bg-elev)", border: "1px solid var(--line)", borderRadius: 12, padding: "8px 12px", fontSize: 13, maxWidth: "100%" }}>
+      <span style={{ width: 8, height: 8, flex: "none", borderRadius: "50%", background: error ? "var(--danger)" : ok ? "var(--ok)" : "var(--warn)" }} />
       <span>{error ? "API offline" : ok ? `API ${health?.status} · v${health?.version ?? "?"}` : "Checking API…"}</span>
       {ok && (
         <span style={{ color: "var(--muted)" }}>
           {health?.llm_configured ? "LLM" : "offline heuristics"}
           {health?.github_configured ? " · GitHub" : ""}
+          {health?.agents_ready?.length ? ` · ${health.agents_ready.length} agents ready` : ""}
         </span>
       )}
     </div>
@@ -340,7 +358,11 @@ function EmptyState({ mode }: { mode: Mode }) {
   return (
     <div style={{ color: "var(--muted)", padding: "48px 8px" }}>
       <h2 style={{ margin: "0 0 8px", color: "var(--text)" }}>No review yet</h2>
-      <p style={{ margin: 0 }}>{mode === "diff" ? "Paste a unified diff or load the sample." : "Enter owner, repo, and a numeric PR number."}</p>
+      <p style={{ margin: 0 }}>
+        {mode === "diff"
+          ? "Paste a unified diff (or load the sample) and run the specialist pipeline. Findings land here with severity first."
+          : "Enter owner, repo, and a numeric PR number. The API fetches the diff and runs the same agents."}
+      </p>
     </div>
   );
 }
