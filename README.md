@@ -36,6 +36,20 @@ supervisor ──┬─> code_reviewer ─────────┐
   structured findings as JSON, for use by other agents.
 - Graph nodes, LLM calls (with token usage), jobs, and HTTP requests emit OpenTelemetry spans; configure an OTel SDK/exporter to collect them.
 
+## Agents
+
+| Agent | Responsibility |
+|-------|----------------|
+| Supervisor | Plans which specialists to run from `focus`, synthesizes the final recommendation |
+| Code Reviewer | Correctness, edge cases, maintainability (also runs the security checks) |
+| Security Specialist | Injection, secrets, auth flaws, insecure defaults |
+| PR Specialist | Title/body quality, size, labels, review comment |
+| Architecture Reviewer | Coupling, boundaries, large cross-cutting changes |
+| Test Specialist | Coverage gaps, new logic without tests |
+| Style Linter | Conventions, naming, TODO/FIXME, docs |
+
+Built with **LangGraph**, **Pydantic**, **FastAPI**, **Typer**, and **Next.js**.
+
 ## Quick start
 
 ```bash
@@ -64,6 +78,17 @@ review history
 
 ## API
 
+```bash
+curl http://localhost:8000/health
+
+curl -X POST http://localhost:8000/v1/review \
+  -H 'Content-Type: application/json' \
+  -d '{"diff": "--- a/foo.py\n+++ b/foo.py\n@@ -0,0 +1 @@\n+result = eval(user_input)\n"}'
+
+# Live GitHub PR (needs GITHUB_TOKEN on the API)
+curl -X POST 'http://localhost:8000/v1/review/github/owner/repo/123?focus=security'
+```
+
 | Method | Path | Notes |
 |--------|------|-------|
 | GET | `/health` | Includes `llm_configured` / `github_configured` |
@@ -72,6 +97,15 @@ review history
 | GET | `/v1/reviews`, `/v1/reviews/{request_id}` | Stored review history |
 | POST | `/v1/webhooks/github` | GitHub `pull_request` events; returns `{"status": "queued", "job_id": ...}` |
 | GET | `/v1/jobs`, `/v1/jobs/{job_id}` | Background job status and result |
+
+### GitHub automation setup
+
+1. Create a GitHub App or token with `pull_requests: write` and `contents: read`, and set `GITHUB_TOKEN`.
+2. Pick a webhook secret and set `GITHUB_WEBHOOK_SECRET` to it.
+3. Add a repository webhook pointing at `POST /v1/webhooks/github` (content type `application/json`,
+   same secret, events: `pull_request`).
+4. On `opened` / `synchronize` / `reopened` / `ready_for_review` the API queues a review job
+   (`GET /v1/jobs/{job_id}`); set `REVIEW_POST_COMMENTS=true` to post the result as a PR comment.
 
 ### Webhooks and safety defaults
 
@@ -93,6 +127,22 @@ cd ui && npm run build
 
 ```bash
 docker compose up --build    # review history persists in the review-data volume
+# or
+docker build -t agentic-review . && docker run -p 8000:8000 --env-file .env agentic-review
+```
+
+## Project layout
+
+```
+agents/     specialist agents (code reviewer, security, architecture, tests, style, PR)
+graphs/     LangGraph orchestration (supervisor → parallel specialists → synthesize)
+tools/      GitHub client, diff parsing, OpenTelemetry helpers
+schemas/    Pydantic models (API contract)
+api/        FastAPI app and background job queue
+cli/        Typer CLI (`review`)
+memory/     SQLite review history and checkpoints
+ui/         Next.js review console
+tests/      offline pytest suite
 ```
 
 ## License

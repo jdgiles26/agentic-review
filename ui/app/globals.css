@@ -30,6 +30,18 @@ button, input, textarea, select {
   color: inherit;
 }
 
+/* Form controls are styled globally: styled-jsx scopes styles to one component,
+   so shared field components (Field) would otherwise render unstyled. */
+label { display: block; font-weight: 600; margin-bottom: 8px; font-size: 13px; }
+input, textarea {
+  width: 100%;
+  min-width: 0;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: 0.55; }
 
