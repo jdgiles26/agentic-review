@@ -1,6 +1,7 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import type { KeyboardEvent } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
 
@@ -54,10 +55,31 @@ type Health = {
 
 type Mode = "diff" | "github";
 
+const MODES: { id: Mode; label: string }[] = [
+  { id: "diff", label: "Paste diff" },
+  { id: "github", label: "GitHub PR" },
+];
+
 const SEVERITY_ORDER = ["critical", "high", "medium", "low", "info"];
 
 export default function Home() {
   const [mode, setMode] = useState<Mode>("diff");
+  const tabRefs = useRef<Record<Mode, HTMLButtonElement | null>>({ diff: null, github: null });
+
+  // ARIA tabs pattern: arrow keys / Home / End move focus and selection within the tablist.
+  function onTabKeyDown(e: KeyboardEvent<HTMLDivElement>) {
+    const i = MODES.findIndex((m) => m.id === mode);
+    const next =
+      e.key === "ArrowRight" ? (i + 1) % MODES.length
+      : e.key === "ArrowLeft" ? (i - 1 + MODES.length) % MODES.length
+      : e.key === "Home" ? 0
+      : e.key === "End" ? MODES.length - 1
+      : null;
+    if (next === null) return;
+    e.preventDefault();
+    setMode(MODES[next].id);
+    tabRefs.current[MODES[next].id]?.focus();
+  }
   const [diff, setDiff] = useState("");
   const [owner, setOwner] = useState("");
   const [repo, setRepo] = useState("");
@@ -154,10 +176,27 @@ export default function Home() {
       </header>
       <div className="layout">
         <section className="panel">
-          <div className="tabs" role="tablist" aria-label="Review source">
-            <button type="button" role="tab" aria-selected={mode === "diff"} className={mode === "diff" ? "tab on" : "tab"} onClick={() => setMode("diff")}>Paste diff</button>
-            <button type="button" role="tab" aria-selected={mode === "github"} className={mode === "github" ? "tab on" : "tab"} onClick={() => setMode("github")}>GitHub PR</button>
+          <div className="tabs" role="tablist" aria-label="Review source" onKeyDown={onTabKeyDown}>
+            {MODES.map((m) => (
+              <button
+                key={m.id}
+                ref={(el) => {
+                  tabRefs.current[m.id] = el;
+                }}
+                type="button"
+                role="tab"
+                id={`tab-${m.id}`}
+                aria-controls={`panel-${m.id}`}
+                aria-selected={mode === m.id}
+                tabIndex={mode === m.id ? 0 : -1}
+                className={mode === m.id ? "tab on" : "tab"}
+                onClick={() => setMode(m.id)}
+              >
+                {m.label}
+              </button>
+            ))}
           </div>
+          <div role="tabpanel" id={`panel-${mode}`} aria-labelledby={`tab-${mode}`}>
           {mode === "diff" ? (
             <>
               <div className="label-row">
@@ -183,6 +222,7 @@ export default function Home() {
             </button>
             {loading && <span className="pulse">Supervisor → specialists → merge findings</span>}
           </div>
+          </div>
         </section>
         <section className="panel">
           {error && <div className="banner bad" role="alert"><strong>Review failed.</strong> {error}</div>}
@@ -201,7 +241,7 @@ export default function Home() {
               )}
               <p className="lede">{result.summary}</p>
               {result.agents_involved.length > 0 && (
-                <div className="chips" aria-label="Agents involved">
+                <div className="chips" role="group" aria-label="Agents involved">
                   {result.agents_involved.map((a) => (
                     <span key={a} className="chip">{a}</span>
                   ))}
